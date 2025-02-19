@@ -13,7 +13,7 @@ project(
 )
 meson.add_dist_script('meson-dist-script.sh')
 
-# When runniog meson dist, the command below produces multiple lines on stderr:
+# When running meson dist, the command below produces multiple lines on stderr:
 # Unable to evaluate subdir([]) in AstInterpreter --> Skipping
 meson.add_dist_script('version.sh', 'set-dist', meson.project_version())
 
@@ -74,7 +74,7 @@ subdir('meson' / 'libresolv')               # res_query
 subdir('meson' / 'dnstap')                  # DNSTAP through libfstream
 subdir('meson' / 'libcurl')                 # Curl
 
-subdir('settings')
+subdir('rec-rust-lib')
 
 common_sources = []
 
@@ -300,7 +300,7 @@ dep_metrics = declare_dependency(
 deps = [
   dep_pdns,
   dep_no_config_in_source,
-  dep_rust_settings,
+  dep_rust_recrust,
   dep_boost,
   dep_boost_context,
   dep_threads,
@@ -313,7 +313,7 @@ deps = [
   dep_libssl,
   dep_lua,
   dep_protozero,
-  dep_yahttp,
+  dep_yahttp_header_only,
   dep_htmlfiles,
   dep_dnstap,
   dep_libcurl,
@@ -398,7 +398,7 @@ librec_common = declare_dependency(
     config_h,
     dependencies: [
       deps,
-      dep_settings_ch,
+      dep_recrust_ch,
       librec_dnslabeltext,
     ],
   )
@@ -423,24 +423,27 @@ tools = {
       dep_nod,
       dep_lua,
       dep_protozero,
-      dep_yahttp,
+      dep_yahttp_header_only,
       dep_json11,
-      dep_settings,
-      dep_rust_settings,
+      dep_recrust,
+      dep_rust_recrust,
       dep_systemd,
       librec_signers_openssl,
       librec_signers_sodium,
       dep_pubsuffix,
     ],
+    'install': true,
+    'install_dir': get_option('sbindir'),
   },
   'rec_control': {
     'main': src_dir / 'rec_control.cc',
     'manpages': ['rec_control.1'],
     'deps-extra': [
       dep_boost,
-      dep_settings,
-      dep_rust_settings,
+      dep_recrust,
+      dep_rust_recrust,
     ],
+    'install': true,
   },
 }
 
@@ -512,8 +515,8 @@ if get_option('unit-tests')
           dep_boost_test,
           dep_lua,
           dep_nod,
-          dep_settings,
-          dep_rust_settings,
+          dep_recrust,
+          dep_rust_recrust,
           librec_signers_openssl,
           librec_signers_sodium,
       ],
@@ -541,6 +544,8 @@ foreach tool, info: tools
   export_dynamic = 'export-dynamic' in info ? info['export-dynamic'] : false
   files_extra = 'files-extra' in info ? info['files-extra'] : []
   deps_extra = 'deps-extra' in info ? info['deps-extra'] : []
+  install = 'install' in info ? info['install'] : false
+  install_dir = 'install_dir' in info ? info['install_dir'] : get_option('bindir')
 
   set_variable(
     var_name,
@@ -554,6 +559,8 @@ foreach tool, info: tools
         librec_common,
         deps_extra,
       ],
+      install: install,
+      install_dir: install_dir,
     )
   )
 
@@ -581,30 +588,41 @@ if python.found()
   foreach tool, info: tools
     if 'manpages' in info
       foreach man_page: info['manpages']
-        generated_man_pages += man_page
+        if not fs.is_file(man_page)
+          generated_man_pages += man_page
+        endif
       endforeach
     endif
   endforeach
-  custom_target(
-     'man-pages',
-     input: man_pages,
-     output: generated_man_pages,
-     install: true,
-     install_dir: join_paths(get_option('mandir'), 'man1'),
-     command: [
-       python,
-       product_source_dir / docs_dir / 'generate-man-pages.py',
-       '--build-root', '@BUILD_ROOT@',
-       '--source-root', '@SOURCE_ROOT@',
-       '--venv-name', 'venv-rec-man-pages',
-       '--requirements-file', docs_dir / 'requirements.txt',
-       '--source-directory', docs_dir,
-       '--target-directory', '@BUILD_ROOT@',
-     ] + man_pages,
-  )
+  if generated_man_pages.length() != 0
+    summary('Generating man pages', true, section: 'Manual Pages')
+    custom_target(
+      'man-pages',
+      input: man_pages,
+      output: generated_man_pages,
+      install: true,
+      install_dir: join_paths(get_option('mandir'), 'man1'),
+      command: [
+        python,
+        product_source_dir / docs_dir / 'generate-man-pages.py',
+        '--build-root', '@BUILD_ROOT@',
+        '--source-root', '@SOURCE_ROOT@',
+        '--venv-name', 'venv-rec-man-pages',
+        '--requirements-file', docs_dir / 'requirements.txt',
+        '--source-directory', docs_dir,
+        '--target-directory', '@BUILD_ROOT@',
+      ] + man_pages,
+    )
+  else
+    summary('Generating man pages', false, section: 'Manual Pages')
+  endif
 endif
 
 if dep_systemd.found()
+  systemd_system_unit_dir = dep_systemd_prog.get_variable(
+    'systemdsystemunitdir',
+  )
+
   systemd_service_conf = configuration_data()
   systemd_service_conf.set('BinDir', get_option('prefix') / get_option('bindir'))
   systemd_service_conf.set('StaticBinDir', get_option('prefix') / get_option('sbindir'))
@@ -676,6 +694,7 @@ if dep_systemd.found()
   rec_service_conf_general.set('Description', 'PowerDNS Recursor')
   rec_service_conf_general.set('ConfigName', '')
   rec_service_conf_general.set('SocketDir', enable_socket_dir ? '--socket-dir=%t/pdns-recursor' : '')
+  rec_service_conf_general.set('RecControlSocketDir', '--socket-dir=%t/pdns-recursor')
   rec_service_conf_general.set('SyslogIdentifier', 'pdns-recursor')
   rec_service_conf_general.set('RuntimeDirectory', 'pdns-recursor')
 
@@ -683,6 +702,8 @@ if dep_systemd.found()
     input: 'pdns-recursor.service.meson.in',
     output: 'pdns-recursor.service',
     configuration: rec_service_conf_general,
+    install: true,
+    install_dir: systemd_system_unit_dir,
   )
 
   rec_service_conf_instance = configuration_data()
@@ -690,6 +711,7 @@ if dep_systemd.found()
   rec_service_conf_instance.set('Description', 'PowerDNS Recursor %i')
   rec_service_conf_instance.set('ConfigName', '--config-name=%i')
   rec_service_conf_instance.set('SocketDir', enable_socket_dir ? '--socket-dir=%t/pdns-recursor-%i' : '')
+  rec_service_conf_instance.set('RecControlSocketDir', '--socket-dir=%t/pdns-recursor-%i')
   rec_service_conf_instance.set('SyslogIdentifier', 'pdns-recursor-%i')
   rec_service_conf_instance.set('RuntimeDirectory', have_systemd_percent_t ? 'pdns-recursor-%i' : 'pdns-recursor')
 
@@ -697,5 +719,18 @@ if dep_systemd.found()
     input: 'pdns-recursor.service.meson.in',
     output: 'pdns-recursor@.service',
     configuration: rec_service_conf_instance,
+    install: true,
+    install_dir: systemd_system_unit_dir,
   )
 endif
+
+
+dep_conf_distfile = custom_target(
+  'gen-conf-distfile',
+  command: [pdns_recursor, '--config=default'],
+  output: 'recursor.yml-dist',
+  capture: true,
+  install: true,
+  install_dir:  get_option('sysconfdir'),
+)
+

@@ -39,11 +39,12 @@
 #include "secpoll-recursor.hh"
 #include "logging.hh"
 #include "dnsseckeeper.hh"
-#include "settings/cxxsettings.hh"
+#include "rec-rust-lib/cxxsettings.hh"
 #include "json.hh"
 #include "rec-system-resolve.hh"
 #include "root-dnssec.hh"
 #include "ratelimitedlog.hh"
+#include "rec-rust-lib/rust/web.rs.h"
 
 #ifdef NOD_ENABLED
 #include "nod.hh"
@@ -110,10 +111,10 @@ std::set<ComboAddress> g_proxyProtocolExceptions;
 boost::optional<ComboAddress> g_dns64Prefix{boost::none};
 DNSName g_dns64PrefixReverse;
 unsigned int g_maxChainLength;
-std::shared_ptr<SyncRes::domainmap_t> g_initialDomainMap; // new threads needs this to be setup
-std::shared_ptr<NetmaskGroup> g_initialAllowFrom; // new thread needs to be setup with this
-std::shared_ptr<NetmaskGroup> g_initialAllowNotifyFrom; // new threads need this to be setup
-std::shared_ptr<notifyset_t> g_initialAllowNotifyFor; // new threads need this to be setup
+LockGuarded<std::shared_ptr<SyncRes::domainmap_t>> g_initialDomainMap; // new threads needs this to be setup
+LockGuarded<std::shared_ptr<NetmaskGroup>> g_initialAllowFrom; // new thread needs to be setup with this
+LockGuarded<std::shared_ptr<NetmaskGroup>> g_initialAllowNotifyFrom; // new threads need this to be setup
+LockGuarded<std::shared_ptr<notifyset_t>> g_initialAllowNotifyFor; // new threads need this to be setup
 bool g_logRPZChanges{false};
 static time_t s_statisticsInterval;
 static std::atomic<uint32_t> s_counter;
@@ -272,6 +273,10 @@ int RecThreadInfo::runThreads(Logr::log_t log)
       taskInfo.start(currentThreadId, "task", cpusMap, log);
     }
 
+    if (::arg().mustDo("webserver")) {
+      serveRustWeb();
+    }
+
     currentThreadId = 1;
     auto& info = RecThreadInfo::info(currentThreadId);
     info.setListener();
@@ -279,10 +284,9 @@ int RecThreadInfo::runThreads(Logr::log_t log)
     RecThreadInfo::setThreadId(currentThreadId);
     recursorThread();
 
-    for (unsigned int thread = 0; thread < RecThreadInfo::numRecursorThreads(); thread++) {
-      if (thread == 1) {
-        continue;
-      }
+    // Skip handler thread (it might be still handling the quit-nicely) and 1, which is actually the main thread in this case;
+    // handler thread (0) will be handled in main().
+    for (unsigned int thread = 2; thread < RecThreadInfo::numRecursorThreads(); thread++) {
       auto& tInfo = RecThreadInfo::info(thread);
       tInfo.thread.join();
       if (tInfo.exitCode != 0) {
@@ -350,7 +354,13 @@ int RecThreadInfo::runThreads(Logr::log_t log)
     info.setHandler();
     info.start(currentThreadId, "web+stat", cpusMap, log);
 
+    if (::arg().mustDo("webserver")) {
+      serveRustWeb();
+    }
     for (auto& tInfo : RecThreadInfo::infos()) {
+      if (tInfo.getName() == "web+stat") { // XXX testing for isHandler() does not work as expected!
+        continue;
+      }
       tInfo.thread.join();
       if (tInfo.exitCode != 0) {
         ret = tInfo.exitCode;
@@ -950,7 +960,7 @@ static void daemonize(Logr::log_t log)
 
 static void termIntHandler([[maybe_unused]] int arg)
 {
-  doExit();
+  _exit(1);
 }
 
 static void usr1Handler([[maybe_unused]] int arg)
@@ -1466,13 +1476,13 @@ void parseACLs()
     allowFrom = nullptr;
   }
 
-  g_initialAllowFrom = allowFrom;
+  *g_initialAllowFrom.lock() = allowFrom;
   // coverity[copy_constructor_call] maybe this can be avoided, but be careful as pointers get passed to other threads
   broadcastFunction([=] { return pleaseSupplantAllowFrom(allowFrom); });
 
   auto allowNotifyFrom = parseACL("allow-notify-from-file", "allow-notify-from", log);
 
-  g_initialAllowNotifyFrom = allowNotifyFrom;
+  *g_initialAllowNotifyFrom.lock() = allowNotifyFrom;
   // coverity[copy_constructor_call] maybe this can be avoided, but be careful as pointers get passed to other threads
   broadcastFunction([=] { return pleaseSupplantAllowNotifyFrom(allowNotifyFrom); });
 
@@ -1960,10 +1970,6 @@ static int initForks(Logr::log_t log)
     signal(SIGTERM, termIntHandler);
     signal(SIGINT, termIntHandler);
   }
-#if defined(__SANITIZE_THREAD__) || (defined(__SANITIZE_ADDRESS__) && defined(HAVE_LEAK_SANITIZER_INTERFACE))
-  // If san is wanted, we dump the info ourselves
-  signal(SIGTERM, termIntHandler);
-#endif
 
   signal(SIGUSR1, usr1Handler);
   signal(SIGUSR2, usr2Handler);
@@ -2227,7 +2233,10 @@ static int serviceMain(Logr::log_t log)
   }
   g_networkTimeoutMsec = ::arg().asNum("network-timeout");
 
-  std::tie(g_initialDomainMap, g_initialAllowNotifyFor) = parseZoneConfiguration(g_yamlSettings);
+  { // Reduce scope of locks (otherwise Coverity induces from this line the global vars below should be
+    // protected by a mutex)
+    std::tie(*g_initialDomainMap.lock(), *g_initialAllowNotifyFor.lock()) = parseZoneConfiguration(g_yamlSettings);
+  }
 
   g_latencyStatSize = ::arg().asNum("latency-statistic-size");
 
@@ -2446,8 +2455,13 @@ static void handleRCC(int fileDesc, FDMultiplexer::funcparam_t& /* var */)
     RecursorControlParser::func_t* command = nullptr;
     auto answer = RecursorControlParser::getAnswer(clientfd, msg, &command);
 
-    g_rcc.send(clientfd, answer);
+    if (command != doExitNicely) {
+      g_rcc.send(clientfd, answer);
+    }
     command();
+    if (command == doExitNicely) {
+      g_rcc.send(clientfd, answer);
+    }
   }
   catch (const std::exception& e) {
     SLOG(g_log << Logger::Error << "Error dealing with control socket request: " << e.what() << endl,
@@ -2819,10 +2833,10 @@ static void recursorThread()
     auto& threadInfo = RecThreadInfo::self();
     {
       SyncRes tmp(g_now); // make sure it allocates tsstorage before we do anything, like primeHints or so..
-      SyncRes::setDomainMap(g_initialDomainMap);
-      t_allowFrom = g_initialAllowFrom;
-      t_allowNotifyFrom = g_initialAllowNotifyFrom;
-      t_allowNotifyFor = g_initialAllowNotifyFor;
+      SyncRes::setDomainMap(*g_initialDomainMap.lock());
+      t_allowFrom = *g_initialAllowFrom.lock();
+      t_allowNotifyFrom = *g_initialAllowNotifyFrom.lock();
+      t_allowNotifyFor = *g_initialAllowNotifyFor.lock();
       t_udpclientsocks = std::make_unique<UDPClientSocks>();
       t_tcpClientCounts = std::make_unique<tcpClientCounts_t>();
       if (g_proxyMapping) {
@@ -2904,24 +2918,9 @@ static void recursorThread()
     }
 
     t_fdm = unique_ptr<FDMultiplexer>(getMultiplexer(log));
-
-    std::unique_ptr<RecursorWebServer> rws;
-
     t_fdm->addReadFD(threadInfo.getPipes().readToThread, handlePipeRequest);
 
     if (threadInfo.isHandler()) {
-      if (::arg().mustDo("webserver")) {
-        SLOG(g_log << Logger::Warning << "Enabling web server" << endl,
-             log->info(Logr::Info, "Enabling web server"));
-        try {
-          rws = make_unique<RecursorWebServer>(t_fdm.get());
-        }
-        catch (const PDNSException& e) {
-          SLOG(g_log << Logger::Error << "Unable to start the internal web server: " << e.reason << endl,
-               log->error(Logr::Critical, e.reason, "Exception while starting internal web server"));
-          _exit(99);
-        }
-      }
       SLOG(g_log << Logger::Info << "Enabled '" << t_fdm->getName() << "' multiplexer" << endl,
            log->info(Logr::Info, "Enabled multiplexer", "name", Logging::Loggable(t_fdm->getName())));
     }
@@ -3018,7 +3017,8 @@ static pair<int, bool> doConfig(Logr::log_t startupLog, const string& configname
       }
     }
     else if (config == "default" || config.empty()) {
-      cout << ::arg().configstring(false, true);
+      auto yaml = pdns::settings::rec::defaultsToYaml();
+      cout << yaml << endl;
     }
     else if (config == "diff") {
       if (!::arg().laxFile(configname)) {
@@ -3141,6 +3141,8 @@ static void setupLogging(const string& logname)
   }
 }
 
+DoneRunning g_doneRunning;
+
 int main(int argc, char** argv)
 {
   g_argc = argc;
@@ -3251,7 +3253,7 @@ int main(int argc, char** argv)
     }
     else {
       configname += ".conf";
-      startupLog->info(Logr::Warning, "Trying to read YAML from .yml or .conf failed, failing back to old-style config read", "configname", Logging::Loggable(configname));
+      startupLog->info(Logr::Warning, "Trying to read YAML from .yml or .conf failed, falling back to old-style config read", "configname", Logging::Loggable(configname));
       bool mustExit = false;
       std::tie(ret, mustExit) = doConfig(startupLog, configname, argc, argv);
       if (ret != 0 || mustExit) {
@@ -3312,6 +3314,12 @@ int main(int argc, char** argv)
     }
 
     ret = serviceMain(startupLog);
+    {
+      std::lock_guard lock(g_doneRunning.mutex);
+      g_doneRunning.done = true;
+      g_doneRunning.condVar.notify_one();
+    }
+    RecThreadInfo::joinThread0();
   }
   catch (const PDNSException& ae) {
     SLOG(g_log << Logger::Error << "Exception: " << ae.reason << endl,

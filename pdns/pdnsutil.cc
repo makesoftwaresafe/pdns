@@ -955,8 +955,8 @@ static int increaseSerial(const DNSName& zone, DNSSECKeeper &dk)
 
   auto rrs = vector<DNSResourceRecord>{rr};
   if (!sd.db->replaceRRSet(sd.domain_id, zone, rr.qtype, rrs)) {
-    sd.db->abortTransaction();
     cerr << "Backend did not replace SOA record. Backend might not support this operation." << endl;
+    sd.db->abortTransaction();
     return -1;
   }
 
@@ -997,7 +997,13 @@ static int deleteZone(const DNSName &zone) {
       return EXIT_SUCCESS;
     }
   } catch (...) {
-    di.backend->abortTransaction();
+    try {
+      di.backend->abortTransaction();
+    } catch (...) {
+      // Ignore this exception (which is likely "cannot rollback - no
+      // transaction is active"), we have a more important one we want to
+      // rethrow.
+    }
     throw;
   }
 
@@ -1113,8 +1119,17 @@ static int listZone(const DNSName &zone) {
 
   while(di.backend->get(rr)) {
     if(rr.qtype.getCode() != 0) {
-      if ( (rr.qtype.getCode() == QType::NS || rr.qtype.getCode() == QType::SRV || rr.qtype.getCode() == QType::MX || rr.qtype.getCode() == QType::CNAME) && !rr.content.empty() && rr.content[rr.content.size()-1] != '.')
-	rr.content.append(1, '.');
+      switch (rr.qtype.getCode()) {
+      case QType::ALIAS:
+      case QType::CNAME:
+      case QType::MX:
+      case QType::NS:
+      case QType::SRV:
+        if (!rr.content.empty() && rr.content[rr.content.size()-1] != '.') {
+          rr.content.append(1, '.');
+        }
+        break;
+      }
 
       cout<<rr.qname<<"\t"<<rr.ttl<<"\tIN\t"<<rr.qtype.toString()<<"\t"<<rr.content<<"\n";
     }
